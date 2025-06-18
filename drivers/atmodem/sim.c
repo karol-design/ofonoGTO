@@ -41,6 +41,7 @@
 #include "util.h"
 
 #include "atmodem.h"
+#include "simfs.h"
 
 #define EF_STATUS_INVALIDATED 0
 #define EF_STATUS_VALID 1
@@ -2145,6 +2146,13 @@ static int at_sim_probe(struct ofono_sim *sim, unsigned int vendor,
 	struct sim_data *sd;
 	unsigned int i;
 
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+	if(sim && vendor == OFONO_VENDOR_GEMALTO_PLS63_PLS83)
+	{	/* CRSM fix default state (prepare to read ICCID to check if need fix) */
+		ofono_sim_enable_crsm_fix_for_viper(sim);
+	}
+#endif
+
 	sd = g_new0(struct sim_data, 1);
 	sd->chat = g_at_chat_clone(chat);
 	sd->vendor = vendor;
@@ -2175,6 +2183,184 @@ static void at_sim_remove(struct ofono_sim *sim)
 	g_free(sd);
 }
 
+
+static const char str_at_csim[] = "AT+CSIM=";
+static const char str_csim_select_iccid[] = "14,\"00A40804022FE2\"";
+static const char str_csim_select_efli[]  = "18,\"00A40804047FFF6F05\"";
+static const char str_csim_select_efpl[]  = "14,\"00A40804022F05\"";
+static const char str_csim_select_efph[]  = "18,\"00A40804047F206FAE\"";
+static const char str_csim_select_efad[]  = "18,\"00A40804047FFF6FAD\"";
+static const char str_csim_select_ef_cphsi[] = "18,\"00A40804047F206F16\"";
+static const char str_csim_select_efust[] = "18,\"00A40804047FFF6F38\"";
+static const char str_csim_select_efimsi[] = "18,\"00A40804047FFF6F07\"";
+static const char str_csim_select_efimg[] = "18,\"00A40804045F504F20\"";
+static const char str_csim_select_efest[] = "18,\"00A40804047FFF6F56\"";
+static const char str_csim_select_efmsisdn[] = "18,\"00A40804047FFF6F40\"";
+static const char str_csim_select_efsdn[] = "18,\"00A40804047FFF6F49\"";
+
+static const char str_csim_read_binary[] = "10,\"00B0000000\"";
+//static const char str_csim_read_info[]   = "10,\"00C0000000\"";
+
+static void at_csim_read_data_02_cb(gboolean ok, GAtResult *result, gpointer user_data)
+{
+    struct cb_data   *cbd = user_data;
+	GAtResultIter iter;
+	ofono_sim_file_read_cb_t cb = cbd->cb;
+	struct ofono_error error;
+	const guint8 *response;
+	gint sw1, len = 0;
+
+	decode_at_error(&error, g_at_result_final_response(result));
+
+	if (!ok) {
+        goto l_error;
+    }
+
+	g_at_result_iter_init(&iter, result);
+
+	if (!g_at_result_iter_next(&iter, "+CSIM:")) {
+		goto l_error;
+    }
+
+	g_at_result_iter_next_number(&iter, &sw1);
+
+	if (!g_at_result_iter_next_hexstring(&iter, &response, &len)) {
+		goto l_error;
+    }
+
+	if(sw1 >= 4 && len >= 2 && response)
+    {
+        cb(1, len, 0, response, 0, cbd->data); // call "sim_fs_op_csim_cb()"
+        return;
+    }
+
+l_error:
+    DBG("at_csim_read_data_02_cb: ERROR %d, %d", sw1, len);
+    cb(0, 0, 0, NULL, 0, (void*) cbd->data); // call "sim_fs_op_csim_cb()"
+}
+
+static void at_csim_read_data_02(ofono_sim_file_read_cb_t cb, struct sim_fs *data)
+{
+    struct sim_data *sd = ofono_sim_fs_get_data(data);
+	struct cb_data *cbd = cb_data_new(cb, data); /* save fs as data in to cbd */
+    char buf[32];
+
+	/* Read binary file from SIM */
+	snprintf(buf, sizeof(buf), "%s%s", str_at_csim, str_csim_read_binary);
+	if (g_at_chat_send(sd->chat, buf, csim_prefix, at_csim_read_data_02_cb, cbd, g_free) > 0)
+		return;
+
+	g_free(cbd);
+	cb(0, 0, 0, NULL, 0, (void*) data); // call "sim_fs_op_csim_cb()"
+}
+
+static void at_csim_read_data_01_cb(gboolean ok, GAtResult *result, gpointer user_data)
+{
+	struct cb_data   *cbd = user_data;
+	GAtResultIter iter;
+	ofono_sim_file_read_cb_t cb = cbd->cb;
+	struct ofono_error error;
+	const guint8 *response;
+	gint sw1, len;
+
+	decode_at_error(&error, g_at_result_final_response(result));
+
+	if (!ok || error.type != OFONO_ERROR_TYPE_NO_ERROR)
+		goto L_error;
+
+	g_at_result_iter_init(&iter, result);
+
+	if (!g_at_result_iter_next(&iter, "+CSIM:"))
+		goto L_error;
+
+	g_at_result_iter_next_number(&iter, &sw1);
+
+	if (!g_at_result_iter_next_hexstring(&iter, &response, &len) ||
+        sw1 != 4 /*|| (ret_code != 0x611E && ret_code != 0x6119)*/)
+    {
+        if(response)
+            DBG("at_csim_read_data_01_cb failed: %d, %s", sw1, response);
+        else
+            DBG("at_csim_read_data_01_cb failed: %d, NULL", sw1);
+		goto L_error;
+	}
+
+    at_csim_read_data_02(cb, cbd->data);
+    return;
+
+L_error: /* notify high level about error */
+	cb(0, 0, 0, NULL, 0, (void*) cbd->data); // call "sim_fs_op_csim_cb()"
+}
+
+static void at_csim_read_data_01(int fileid, ofono_sim_file_read_cb_t cb, struct sim_fs *data)
+{
+    struct sim_data *sd = ofono_sim_fs_get_data(data);
+	struct cb_data   *cbd = cb_data_new(cb, data); /* save fs as data in to cbd */
+	char buf[36];
+	const char *chptr;
+
+	switch(fileid)
+	{
+	    case SIM_EF_ICCID_FILEID:
+	        chptr = str_csim_select_iccid;
+            break;
+        case SIM_EFLI_FILEID:
+            chptr = str_csim_select_efli;
+            break;
+        case SIM_EFPL_FILEID:
+            chptr = str_csim_select_efpl;
+            break;
+        case SIM_EFPHASE_FILEID:
+            chptr = str_csim_select_efph;
+            break;
+        case SIM_EFAD_FILEID:
+            chptr = str_csim_select_efad;
+            break;
+        case SIM_EF_CPHS_INFORMATION_FILEID:
+            chptr = str_csim_select_ef_cphsi;
+            break;
+        case SIM_EFUST_FILEID:
+            chptr = str_csim_select_efust;
+            break;
+        case SIM_EFIMSI_FILEID:
+            chptr = str_csim_select_efimsi;
+            break;
+        case SIM_EFIMG_FILEID:
+            chptr = str_csim_select_efimg;
+            break;
+        case SIM_EFEST_FILEID:
+            chptr = str_csim_select_efest;
+            break;
+        case SIM_EFMSISDN_FILEID:
+            chptr = str_csim_select_efmsisdn;
+            break;
+        case SIM_EFSDN_FILEID:
+            chptr = str_csim_select_efsdn;
+            break;
+        default:
+            chptr = NULL;
+            DBG("ERROR: unsupported parameter %x", fileid);
+            goto error;
+	}
+
+	/* Set SIM file address to read */
+	snprintf(buf, sizeof(buf), "%s%s", str_at_csim, chptr);
+
+	if (g_at_chat_send(sd->chat, buf, csim_prefix,
+				at_csim_read_data_01_cb, cbd, g_free) > 0)
+        return;
+error:
+	g_free(cbd);
+	cb(0, 0, 0, NULL, 0, (void*) data); // call "sim_fs_op_csim_cb()"
+}
+
+static void at_csim_read_data(int fileid, ofono_sim_file_read_cb_t cb, void *data)
+{
+    /* struct sim_fs *data */
+    at_csim_read_data_01(fileid, cb, data);
+}
+
+
 static const struct ofono_sim_driver driver = {
 	.name			= "atmodem",
 	.probe			= at_sim_probe,
@@ -2203,6 +2389,7 @@ static const struct ofono_sim_driver driver = {
 	.session_read_record	= at_session_read_record,
 	.session_read_info	= at_session_read_info,
 	.logical_access		= at_logical_access,
+	.read_csim          = at_csim_read_data,
 	.trigger_fallback	= at_trigger_fallback,
 	.cancel_fallback	= at_cancel_fallback
 };

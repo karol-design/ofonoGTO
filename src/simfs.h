@@ -21,6 +21,9 @@
 
 struct sim_fs;
 
+void *ofono_sim_fs_get_data(struct sim_fs *sf);
+void *ofono_sim_context_get_sim(struct ofono_sim_context *context);
+
 typedef void (*sim_fs_read_info_cb_t)(int ok, unsigned char file_status,
 					int total_length, int record_length,
 					void *userdata);
@@ -46,6 +49,10 @@ int sim_fs_read(struct ofono_sim_context *context, int id,
 		enum ofono_sim_file_structure expected_type,
 		unsigned short offset, unsigned short num_bytes,
 		const unsigned char *path, unsigned int len,
+		ofono_sim_file_read_cb_t cb, void *data);
+
+int sim_csim_read(struct ofono_sim_context *context, int id,
+		enum ofono_sim_file_structure expected_type,
 		ofono_sim_file_read_cb_t cb, void *data);
 
 int sim_fs_read_info(struct ofono_sim_context *context, int id,

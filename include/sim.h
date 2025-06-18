@@ -214,6 +214,8 @@ struct ofono_sim_driver {
 	void (*logical_access)(struct ofono_sim *sim, int session_id,
 			const unsigned char *pdu, unsigned int len,
 			ofono_sim_logical_access_cb_t cb, void *data);
+	void (*read_csim)(int fileid, ofono_sim_file_read_cb_t cb,
+			void *data);
 	void (*trigger_fallback)(struct ofono_sim *sim,
 			ofono_sim_lock_unlock_cb_t cb, void *data);
 	void (*cancel_fallback)(struct ofono_sim *sim,
@@ -313,6 +315,11 @@ void ofono_sim_remove_file_watch(struct ofono_sim_context *context,
 int ofono_sim_logical_access(struct ofono_sim *sim, int session_id,
 		unsigned char *pdu, unsigned int len,
 		ofono_sim_logical_access_cb_t cb, void *data);
+
+unsigned int ofono_context_is_crsm_fix_ena(struct ofono_sim_context *context);
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+void ofono_sim_enable_crsm_fix_for_viper(struct ofono_sim *sim);
+#endif
 
 #ifdef __cplusplus
 }

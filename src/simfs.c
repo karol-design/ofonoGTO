@@ -54,6 +54,7 @@
 static gboolean sim_fs_op_next(gpointer user_data);
 static gboolean sim_fs_op_read_record(gpointer user);
 static gboolean sim_fs_op_read_block(gpointer user_data);
+static gboolean sim_fs_op_csim(gpointer user_data);
 
 struct sim_fs_op {
 	int id;
@@ -90,6 +91,16 @@ struct sim_fs {
 	int session_id;
 	unsigned int watch_id;
 };
+
+void *ofono_sim_fs_get_data(struct sim_fs *sf)
+{
+	return ofono_sim_get_data(sf->sim);
+}
+
+void *ofono_sim_context_get_sim(struct ofono_sim_context *context)
+{
+	return context->fs->sim;
+}
 
 static void sim_fs_op_free(gpointer pointer)
 {
@@ -264,12 +275,17 @@ void sim_fs_notify_file_watches(struct sim_fs *fs, int id)
 
 }
 
-static void sim_fs_end_current(struct sim_fs *fs)
+static void sim_fs_end_current(struct sim_fs *fs, gboolean use_csim)
 {
 	struct sim_fs_op *op = g_queue_pop_head(fs->op_q);
 
 	if (g_queue_get_length(fs->op_q) > 0)
-		fs->op_source = g_idle_add(sim_fs_op_next, fs);
+    {
+        if(use_csim)              // Use CSIM read
+            fs->op_source = g_idle_add(sim_fs_op_csim, fs);
+        else                      // Use CRSM read
+            fs->op_source = g_idle_add(sim_fs_op_next, fs);
+    }
 	else if (fs->watch_id) /* release the session if no pending reads */
 		__ofono_sim_remove_session_watch(fs->session, fs->watch_id);
 
@@ -288,7 +304,7 @@ static void sim_fs_op_error(struct sim_fs *fs)
 	struct sim_fs_op *op = g_queue_peek_head(fs->op_q);
 
 	if (op->cb == NULL) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return;
 	}
 
@@ -302,7 +318,7 @@ static void sim_fs_op_error(struct sim_fs *fs)
 		((ofono_sim_file_write_cb_t) op->cb)
 			(0, op->userdata);
 
-	sim_fs_end_current(fs);
+	sim_fs_end_current(fs, FALSE);
 }
 
 static gboolean cache_block(struct sim_fs *fs, int block, int block_len,
@@ -352,7 +368,7 @@ static void sim_fs_op_write_cb(const struct ofono_error *error, void *data)
 	ofono_sim_file_write_cb_t cb = op->cb;
 
 	if (cb == NULL) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return;
 	}
 
@@ -361,7 +377,7 @@ static void sim_fs_op_write_cb(const struct ofono_error *error, void *data)
 	else
 		cb(0, op->userdata);
 
-	sim_fs_end_current(fs);
+	sim_fs_end_current(fs, FALSE);
 }
 
 static void sim_fs_op_read_block_cb(const struct ofono_error *error,
@@ -403,7 +419,7 @@ static void sim_fs_op_read_block_cb(const struct ofono_error *error,
 	cache_block(fs, op->current, 256, data, len);
 
 	if (op->cb == NULL) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return;
 	}
 
@@ -415,7 +431,7 @@ static void sim_fs_op_read_block_cb(const struct ofono_error *error,
 		cb(1, op->num_bytes, 0, op->buffer,
 				op->record_length, op->userdata);
 
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 	} else {
 		fs->op_source = g_idle_add(sim_fs_op_read_block, fs);
 	}
@@ -432,7 +448,7 @@ static gboolean sim_fs_op_read_block(gpointer user_data)
 	fs->op_source = 0;
 
 	if (op->cb == NULL) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return FALSE;
 	}
 
@@ -489,7 +505,7 @@ static gboolean sim_fs_op_read_block(gpointer user_data)
 		cb(1, op->num_bytes, 0, op->buffer,
 				op->record_length, op->userdata);
 
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 
 		return FALSE;
 	}
@@ -528,7 +544,7 @@ static void sim_fs_op_retrieve_cb(const struct ofono_error *error,
 			data, op->record_length);
 
 	if (cb == NULL) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return;
 	}
 
@@ -538,7 +554,7 @@ static void sim_fs_op_retrieve_cb(const struct ofono_error *error,
 		op->current += 1;
 		fs->op_source = g_idle_add(sim_fs_op_read_record, fs);
 	} else {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 	}
 }
 
@@ -553,7 +569,7 @@ static gboolean sim_fs_op_read_record(gpointer user)
 	fs->op_source = 0;
 
 	if (op->cb == NULL) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return FALSE;
 	}
 
@@ -580,7 +596,7 @@ static gboolean sim_fs_op_read_record(gpointer user)
 	}
 
 	if (op->current > total) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 
 		return FALSE;
 	}
@@ -700,7 +716,7 @@ static void sim_fs_op_info_cb(const struct ofono_error *error, int length,
 	}
 
 	if (op->cb == NULL) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return;
 	}
 
@@ -734,8 +750,27 @@ static void sim_fs_op_info_cb(const struct ofono_error *error, int length,
 		cb(1, file_status, op->length,
 			op->record_length, op->userdata);
 
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 	}
+}
+
+static void sim_fs_op_csim_cb(int X_ok, int length, int X_record, const unsigned char *data,
+				int X_record_length, void *userdata)
+{
+    struct sim_fs *fs = userdata;
+    struct sim_fs_op *op = g_queue_peek_head(fs->op_q);
+	ofono_sim_file_read_cb_t cb;
+
+    if (!op || !op->cb) {
+        sim_fs_end_current(fs, TRUE);
+        return;
+    }
+
+    op->length = length;
+    cb = op->cb;
+
+    cb(1, length, 0, data, 0, op->userdata);
+    sim_fs_end_current(fs, TRUE);
 }
 
 static gboolean sim_fs_op_check_cached(struct sim_fs *fs)
@@ -812,7 +847,7 @@ static gboolean sim_fs_op_check_cached(struct sim_fs *fs)
 		cb(1, file_status, op->length,
 			op->record_length, op->userdata);
 
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 	} else if (structure == OFONO_SIM_FILE_STRUCTURE_TRANSPARENT) {
 		if (op->num_bytes == 0)
 			op->num_bytes = op->length;
@@ -846,7 +881,7 @@ static void sim_fs_read_session_cb(const struct ofono_error *error,
 	cb = op->cb;
 	cb(TRUE, length, 0, sdata, length, op->userdata);
 
-	sim_fs_end_current(fs);
+	sim_fs_end_current(fs, FALSE);
 }
 
 static void session_read_info_cb(const struct ofono_error *error,
@@ -873,7 +908,7 @@ static void session_read_info_cb(const struct ofono_error *error,
 
 		cb(1, file_status, filelength, recordlength, op->userdata);
 
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return;
 	}
 
@@ -938,7 +973,7 @@ static gboolean sim_fs_op_next(gpointer user_data)
 	op = g_queue_peek_head(fs->op_q);
 
 	if (op->cb == NULL) {
-		sim_fs_end_current(fs);
+		sim_fs_end_current(fs, FALSE);
 		return FALSE;
 	}
 
@@ -988,6 +1023,28 @@ static gboolean sim_fs_op_next(gpointer user_data)
 		op->buffer = NULL;
 	}
 
+	return FALSE;
+}
+
+static gboolean sim_fs_op_csim(gpointer user_data)
+{
+	struct sim_fs *fs = user_data;
+	const struct ofono_sim_driver *driver = fs->driver;
+	struct sim_fs_op *op;
+
+	fs->op_source = 0;
+
+	if (fs->op_q == NULL) {
+            return FALSE;
+        }
+
+	op = g_queue_peek_head(fs->op_q);
+
+	if (op->cb == NULL) {
+		sim_fs_end_current(fs, TRUE);
+		return FALSE;
+	}
+        driver->read_csim(op->id, sim_fs_op_csim_cb, fs);
 	return FALSE;
 }
 
@@ -1083,6 +1140,48 @@ int sim_fs_read(struct ofono_sim_context *context, int id,
 		fs->op_source = g_idle_add(sim_fs_op_next, fs);
 
 	return 0;
+}
+
+int sim_csim_read(struct ofono_sim_context *context, int id,
+		enum ofono_sim_file_structure expected_type,
+		ofono_sim_file_read_cb_t cb, void *data)
+{
+    /* data here is "struct ofono_sim *sim" */
+    struct sim_fs *fs = context->fs;
+    struct sim_fs_op *op;
+
+    if (cb == NULL)
+        return -EINVAL;
+
+    if (fs->driver == NULL)
+        return -EINVAL;
+
+    if (!fs->driver->read_csim)
+    {
+        cb(0, 0, 0, NULL, 0, data);
+        return -ENOSYS;
+    }
+
+    if (fs->op_q == NULL)
+        fs->op_q = g_queue_new();
+
+    op = g_try_new0(struct sim_fs_op, 1);
+    if (op == NULL)
+        return -ENOMEM;
+
+    op->id = id;
+    op->structure = expected_type;
+    op->cb = cb;
+    op->userdata = data;
+    op->is_read = TRUE;
+    op->context = context;
+
+    g_queue_push_tail(fs->op_q, op);
+
+    if (g_queue_get_length(fs->op_q) == 1)
+        fs->op_source = g_idle_add(sim_fs_op_csim, fs);
+
+    return 0;
 }
 
 int sim_fs_write(struct ofono_sim_context *context, int id,

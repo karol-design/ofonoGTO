@@ -141,6 +141,9 @@ struct ofono_sim {
 	bool initialized : 1;
 	bool wait_initialized : 1;
 	bool simstatus_ready : 1;
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+	unsigned int sim_crsm_fix : 3; /* apply SIM fix to use CSIM command instead of CRSM */
+#endif
 };
 
 struct msisdn_set_request {
@@ -176,7 +179,10 @@ static const char *const passwd_name[] = {
 
 static void sim_own_numbers_update(struct ofono_sim *sim);
 static void sim_initialize(struct ofono_sim *sim);
-
+static gboolean sim_late_initialize(gpointer userdata);
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+static gboolean ofono_sim_if_needs_crsm_fix(char* sim_iccid);
+#endif /* CRSM_TO_CSIM_VIPER_FIX */
 static GSList *g_drivers = NULL;
 
 static const char *sim_passwd_name(enum ofono_sim_password_type type)
@@ -2289,11 +2295,14 @@ static void sim_iccid_read_cb(int ok, int length, int record,
 
 	if (!ok || length < 10)
 	{
-		if(read_retry == 0) /* retry iccid read second time */
+		if(read_retry == 0)
 		{
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+			sim->sim_crsm_fix = 0;
+#endif
 			ofono_sim_read(sim->early_context, SIM_EF_ICCID_FILEID,
-				OFONO_SIM_FILE_STRUCTURE_TRANSPARENT,
-				sim_iccid_read_cb, sim);
+			OFONO_SIM_FILE_STRUCTURE_TRANSPARENT,
+			sim_iccid_read_cb, sim);
 		}
 		read_retry = 1;
 		return;
@@ -2304,6 +2313,10 @@ static void sim_iccid_read_cb(int ok, int length, int record,
 	sim->iccid = g_strdup(iccid);
 
 	DBG("iccid update: %s", iccid);
+
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+	sim->sim_crsm_fix = ofono_sim_if_needs_crsm_fix(iccid);
+#endif
 
 	ofono_dbus_signal_property_changed(conn, path,
 						OFONO_SIM_MANAGER_INTERFACE,
@@ -2406,12 +2419,28 @@ static void sim_initialize(struct ofono_sim *sim)
 
 	/* Grab the EFiccid which is always available */
 	ofono_sim_read(sim->early_context, SIM_EF_ICCID_FILEID,
-			OFONO_SIM_FILE_STRUCTURE_TRANSPARENT,
-			sim_iccid_read_cb, sim);
+			OFONO_SIM_FILE_STRUCTURE_TRANSPARENT, sim_iccid_read_cb, sim);
 	ofono_sim_add_file_watch(sim->early_context, SIM_EF_ICCID_FILEID,
-					sim_iccid_changed, sim, NULL);
+            sim_iccid_changed, sim, NULL);
 
-	/* EFecc is read by the voicecall atom */
+     sim_late_initialize(sim);
+}
+
+static gboolean sim_late_initialize(gpointer userdata)
+{
+    struct ofono_sim *sim = userdata;
+
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+    /* Read ICCID with CSIM cmd and decide which CRSM/CSIM to use */
+    if (sim->sim_crsm_fix > 1)
+	{
+		DBG("Waiting for ICCID read...");
+		g_timeout_add_seconds(2, sim_late_initialize, sim);
+		return FALSE;
+	}
+#endif
+
+    /* EFecc is read by the voicecall atom */
 
 	/*
 	 * According to 31.102 the EFli is read first and EFpl is then
@@ -2432,6 +2461,8 @@ static void sim_initialize(struct ofono_sim *sim)
 			sim_efpl_read_cb, sim);
 	ofono_sim_add_file_watch(sim->early_context, SIM_EFPL_FILEID,
 					sim_efli_efpl_changed, sim, NULL);
+
+    return FALSE; // don't call automatically again
 }
 
 struct ofono_sim_context *ofono_sim_context_create(struct ofono_sim *sim)
@@ -2486,7 +2517,14 @@ int ofono_sim_read(struct ofono_sim_context *context, int id,
 			enum ofono_sim_file_structure expected_type,
 			ofono_sim_file_read_cb_t cb, void *data)
 {
-	return sim_fs_read(context, id, expected_type, 0, 0, NULL, 0, cb, data);
+    if(ofono_context_is_crsm_fix_ena(context))    // Use +CSIM command
+    {
+        return sim_csim_read(context, id, expected_type, cb, data);
+    }
+    else                                      // Use CRSM command
+    {
+        return sim_fs_read(context, id, expected_type, 0, 0, NULL, 0, cb, data);
+    }
 }
 
 int ofono_sim_write(struct ofono_sim_context *context, int id,
@@ -3851,3 +3889,51 @@ int ofono_sim_logical_access(struct ofono_sim *sim, int session_id,
 
 	return 0;
 }
+
+unsigned int ofono_context_is_crsm_fix_ena(struct ofono_sim_context *context)
+{
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+    struct ofono_sim *sim = ofono_sim_context_get_sim(context);
+	return sim->sim_crsm_fix;
+#else
+	return 0;
+#endif
+}
+
+#ifdef CRSM_TO_CSIM_VIPER_FIX
+/* Idea of this fix is to check SIM ICCID and search the prefix
+ * to be in list of "defective" cards and based on this, decide
+ * if we need to apply CRSM -> CSIM command switch or not
+ */
+void ofono_sim_enable_crsm_fix_for_viper(struct ofono_sim *sim)
+{
+    /* CRSM fix enable (prepare to read ICCID to check if need fix) */
+    DBG("ENABLED: CSIM command instead of CRSM");
+    sim->sim_crsm_fix = 2;
+}
+
+/* Use CSIM instead of CRSM to read SIM files */
+static gboolean ofono_sim_if_needs_crsm_fix(char* sim_iccid)
+{
+    static const char* iccid_prefix_sim_needs_crsm_fix[] =
+    {
+        "8988247",  // Transtel
+        "8933104",  // T-mobile
+        "000000"
+    };
+
+    unsigned int i = 0;
+    const char *iccid_prefix;
+    while(i < sizeof(iccid_prefix_sim_needs_crsm_fix)/sizeof(char*))
+    {
+        iccid_prefix = iccid_prefix_sim_needs_crsm_fix[i++];
+        if(iccid_prefix && g_ascii_strncasecmp(sim_iccid, iccid_prefix, strlen(iccid_prefix)) == 0)
+        {
+            DBG("iccid prefix \"%s\" matches, applying CRSM -> CSIM fix",
+                iccid_prefix_sim_needs_crsm_fix[i-1]);
+            return  TRUE;
+        };
+    };
+    return FALSE;
+}
+#endif /* CRSM_TO_CSIM_VIPER_FIX */

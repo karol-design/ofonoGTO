@@ -1943,6 +1943,7 @@ static void gemalto_ciev_notify(GAtResult *result, gpointer user_data)
 	const char *ind_str;
 	GAtResultIter iter;
 
+	DBG("");
 	g_at_result_iter_init(&iter, result);
 
 	/* Example: +CIEV: simstatus,<status> */
@@ -3051,8 +3052,9 @@ static void gemalto_pre_sim(struct ofono_modem *modem)
 {
 	struct gemalto_data *data = ofono_modem_get_data(modem);
 	int vendor = OFONO_VENDOR_GEMALTO;
+	const char *model = ofono_modem_get_string(modem, "Model");
+	unsigned int modem_hw_id;
 
-	DBG("%p", modem);
 	gemalto_exec_stored_cmd(modem, "pre_sim");
 
 	if (!data) {
@@ -3077,8 +3079,22 @@ static void gemalto_pre_sim(struct ofono_modem *modem)
 	               gemalto_retrieve_provider, modem, NULL);
 
 	ofono_location_reporting_create(modem, 0, "gemaltomodem", data->app);
-	data->sim = ofono_sim_create(modem, OFONO_VENDOR_GEMALTO,
-		"atmodem", data->app);
+
+	if(model == NULL)
+		return;
+
+	modem_hw_id = strtol(model, NULL, 16);
+    DBG("Modem HW ver: 0x%4x", modem_hw_id);
+    if(modem_hw_id == OFONO_VENDOR_GEMALTO_CINT_PLS63_PLS83)
+    {
+        data->sim = ofono_sim_create(modem, OFONO_VENDOR_GEMALTO_PLS63_PLS83,
+            "atmodem", data->app);
+    }
+    else
+    {
+        data->sim = ofono_sim_create(modem, OFONO_VENDOR_GEMALTO,
+            "atmodem", data->app);
+    }
 
 	if (data->sim && data->have_sim == TRUE)
 		ofono_sim_inserted_notify(data->sim, TRUE);
